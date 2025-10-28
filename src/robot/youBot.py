@@ -11,6 +11,7 @@ class youBot:
         """
             Initialization of hardcodded parameters
         """
+        self.dt = 0.01 #Step time (s)
         self.r = 0.0475 #Radius of each wheel (m)
         self.l = 0.47/2 #Forward-backward distance between the wheels (m)
         self.w = 0.3/2 #Side-to-side distance between wheels (m)
@@ -19,7 +20,21 @@ class youBot:
                                          [self.l,-self.w],
                                          [-self.l,-self.w],
                                          [-self.l,self.w]]) #Locations of the wheel in the chassis frame (m)
+        gripper_d3 = 0.043 #The distance from the base of gripper the fingers to the end effector frame {e}
+        cube_side = 0.05 #The length of the cube sides
+        a = 5*np.pi/4#Rotation angle of the end effector frame around the cube's y axis  
+        self.Tce_grasp = np.array([[np.cos(a),0,np.sin(a),np.cos(-np.pi/4)*(gripper_d3-np.sqrt(2*((cube_side/2)**2)))],
+                                   [0,1,0,0],
+                                   [-np.sin(a),0,np.cos(a),np.sin(-np.pi/4)*(gripper_d3-np.sqrt(2*((cube_side/2)**2)))],
+                                   [0,0,0,1]]) #The end-effector's configuration relative to the cube when it is grasping the cube
         
+        self.Tce_standoff = np.array([[np.cos(a),0,np.sin(a),0.3*np.cos(3*np.pi/4)],
+                                      [0,1,0,0],
+                                      [-np.sin(a),0,np.cos(a),0.3*np.sin(3*np.pi/4)],
+                                      [0,0,0,1]]) #The end-effector's standoff configuration above the cube, before and after grasping, relative to the cube. 
+        self.v_max = 0.5 #Maximum linear velocity of the end-effector (m/s)
+        self.omega_max = 4*np.pi #Maximum angular velocity of the end-effector (rad/s)
+        self.grasp_time = 0.625 #Time it takes for gripper to transition from one state to another (sec)
 
     def next_state(self,config,controls,dt,u_max):
         """
@@ -40,7 +55,7 @@ class youBot:
         """
         
         controls = np.clip(controls, -u_max, u_max) # Saturation 
-        
+
         joint_angles = config[3:8]
         wheel_angles = config[8:]
         wheel_speeds = controls[0:4]
@@ -85,3 +100,30 @@ class youBot:
         new_config = np.concatenate([q1,next_arm_joint_angles,next_arm_wheel_angles])
 
         return new_config
+    
+    def trajectory_generator(self,Tse_initial,Tsc_initial,Tsc_final,Tce_grasp,Tce_standoff,k):
+        
+        
+        def segment(initial,final):
+
+            #Calculate distance and rotation angle to pick travel time that would fit the limits
+            [Ri,pi] = mr.TransToRp(initial)
+            [Rf,pf] = mr.TransToRp(final)            
+            travel_distance = np.linalg.norm(pf-pi)
+            Rrel = Rf @ Ri.T
+            angle_rotation = (np.trace(Rrel) - 1.0) / 2.0 
+
+            Tf = round(max(travel_distance/self.v_max,angle_rotation/self.omega_max)/self.dt)*self.dt #Time of segment (s)
+            N = Tf * k / self.dt #Number of points 
+            path = mr.CartesianTrajectory(initial,final,Tf,N)
+
+            return path
+        
+        def grasp(configuration):
+
+            configuration[-1] = 1 - configuration[-1] #Flip the gripper state
+            N = round(self.grasp_time / self.dt) * self.dt
+            rounded_up_N = int(-(-N // 1))
+            return np.tile(configuration,N)
+        
+        #TODO: Build out each segment
