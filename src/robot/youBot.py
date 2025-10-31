@@ -11,18 +11,46 @@ class youBot:
         """
             Initialization of hardcodded parameters
         """
+
+        self.Tbo = np.array([
+            [1, 0, 0, 0.1662],
+            [0, 1, 0, 0.0],
+            [0, 0, 1, 0.0026],
+            [0, 0, 0, 1.0]
+        ]) #Configuration of {o} (Base of arm) in relation to chassis frame
+
+        self.blist = np.array([
+            [0, 0, 1, 0, 0.033, 0],
+            [0, -1, 0, -0.5076, 0, 0],
+            [0, -1, 0, -0.3526, 0, 0],
+            [0, -1, 0, -0.2176, 0, 0],
+            [0, 0, 1, 0, 0, 0]
+        ]).T #When the arm is at its home configuration, the screw axes for the five joints are expressed in the end-effector frame {e} 
+
+        self.M0e = np.array([
+            [1, 0, 0, 0.033],
+            [0, 1, 0, 0.0],
+            [0, 0, 1, 0.6546],
+            [0, 0, 0, 1.0]
+        ]) #the end-effector frame {e} relative to the arm base frame {0} When the arm is at its home configuration
+
+        self.u_max = 10 #Maximum speed
+        self.z = 0.0963 #Height of the chassis body frame {b}
         self.dt = 0.01 #Step time (s)
         self.r = 0.0475 #Radius of each wheel (m)
         self.l = 0.47/2 #Forward-backward distance between the wheels (m)
         self.w = 0.3/2 #Side-to-side distance between wheels (m)
         self.gamma = [-np.pi/4,np.pi/4,-np.pi/4,np.pi/4] #free sliding direction of each wheel (rad)
+
         self.wheel_locations = np.array([[self.l,self.w],
                                          [self.l,-self.w],
                                          [-self.l,-self.w],
                                          [-self.l,self.w]]) #Locations of the wheel in the chassis frame (m)
+        
         gripper_d3 = 0.043 #The distance from the base of gripper the fingers to the end effector frame {e}
         cube_side = 0.05 #The length of the cube sides
         a = -5*np.pi/4#Rotation angle of the end effector frame around the cube's y axis  
+
         self.Tce_grasp = np.array([[np.cos(a),0,np.sin(a),np.cos(-np.pi/4)*(gripper_d3-np.sqrt(2*((cube_side/2)**2)))],
                                    [0,1,0,0],
                                    [-np.sin(a),0,np.cos(a),np.sin(-np.pi/4)*(gripper_d3-np.sqrt(2*((cube_side/2)**2)))],
@@ -32,9 +60,16 @@ class youBot:
                                       [0,1,0,0],
                                       [-np.sin(a),0,np.cos(a),0.3*np.sin(3*np.pi/4)],
                                       [0,0,0,1]]) #The end-effector's standoff configuration above the cube, before and after grasping, relative to the cube. 
+        
         self.v_max = 0.5 #Maximum linear velocity of the end-effector (m/s)
         self.omega_max = 4*np.pi #Maximum angular velocity of the end-effector (rad/s)
         self.grasp_time = 0.625 #Time it takes for gripper to transition from one state to another (sec)
+
+        self.F = (self.r / 4) * np.array([
+            [-1 / (self.l + self.w),  1 / (self.l + self.w),  1 / (self.l + self.w), -1 / (self.l + self.w)],
+            [ 1,                      1,                      1,                      1                     ],
+            [-1,                      1,                     -1,                      1                     ]
+        ]) # wheel configuration matrix for a omnidirectional robot
 
     def next_state(self,config,controls,dt,u_max):
         """
@@ -101,7 +136,7 @@ class youBot:
 
         return new_config
     
-    def trajectory_generator(self,Tse_initial,Tsc_initial,Tsc_final,Tce_grasp,Tce_standoff,k):
+    def trajectory_generator(self,Tse_initial,Tsc_initial,Tsc_final,Tce_grasp=None,Tce_standoff=None,k=1):
         """
             Function: trajectory_generator
             Description:
@@ -199,7 +234,12 @@ class youBot:
             result = np.tile(configuration,(N,1))
             return result
         
-        #TODO: Build out each segment (#NOTE: Need to make sure you have the gripper state)
+
+        if Tce_grasp is None:
+            Tce_grasp = self.Tce_grasp
+        if Tce_standoff is None:
+            Tce_standoff = self.Tce_standoff
+        self.k = k
         # 1.Move to grasp standoff
         configuration = segment(Tse_initial,Tsc_initial@Tce_standoff,0)
         # 2.Move to grasp
@@ -216,3 +256,88 @@ class youBot:
         configuration = np.concatenate((configuration,grasp(configuration[-1, :])))
 
         return configuration
+    
+    def feedback_control(self,X,Xd,Xd1,K,dt):
+
+        [Kp,Ki] = K
+        Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Xd) @ X))
+        self.integral = self.integral + Xerr*dt
+        Vdmat = (1/dt)*mr.MatrixLog6(mr.TransInv(Xd)@Xd1)
+        Vd = mr.se3ToVec(Vdmat)
+        Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd + Kp@Xerr + Ki@self.integral #PID Controller, end effector twist.
+        
+        return Ve
+    
+    def simulate_bot(self,trajectory,K,config_initial):
+        
+        k = self.k
+        N = len(trajectory)
+        self.integral = 0
+        #Loop through generated trajectory step by step
+
+        config_list = np.array([config_initial]) #List of configurations for results
+        Xerr_list = np.empty((1,6)) #List of errors at every step
+        configuration = config_initial
+
+        for i in range(N-1):
+            
+            #Get the end effector configuration
+            Tsb = self.chassis_to_SE3(configuration) 
+            Toe = mr.FKinBody(self.M0e,self.blist,configuration[3:8])
+            X = Tsb@self.Tbo@Toe
+
+            #Use the controller at this time step for end effector twist needed
+            Xd = self.chassis_to_SE3(trajectory[i,:]) #Reference configuration 
+            Xdnext = self.chassis_to_SE3(trajectory[i+1,:]) #Next reference configuration
+            Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Xd) @ X)) #Error at this step
+            Ve = self.feedback_control(X,Xd,Xdnext,K,self.dt) #Get end effector twist needed {e}
+
+            #Calculate Jacobian
+            Jb = mr.JacobianBody(self.blist,configuration[3:8])
+            F6 = np.concatenate((
+                np.zeros((1, 4)),
+                np.zeros((1, 4)),
+                self.F,
+                np.zeros((1, 4))
+            ), axis=0)
+            Jbase = mr.Adjoint(mr.TransInv(X)@Tsb)@F6 
+
+            np.set_printoptions(precision=3, suppress=True)
+            Je = np.hstack((Jbase, Jb))
+
+            #Calculate controls required for the twist that is needed
+            controls = np.linalg.pinv(Je,0.01)@Ve
+
+            #Update configuration
+            configuration = self.next_state(configuration[:12],controls,self.dt,self.u_max)
+            configuration = np.append(configuration,trajectory[i,12])
+
+            if i%k == 0: #Save Configuration and Xerr for results
+                Xerr_list = np.vstack((Xerr_list,Xerr))
+                config_list = np.vstack((config_list,configuration))
+
+        return config_list,Xerr_list
+    
+    def chassis_to_SE3(self,configuration):
+
+            phi, x, y = configuration[:3]
+
+            R = np.array([
+                [np.cos(phi), -np.sin(phi), 0],
+                [np.sin(phi),  np.cos(phi), 0],
+                [0,            0,           1]
+            ])
+
+            p = np.array([[x], [y], [self.z]])  # position on the ground plane
+
+            T = np.block([
+                [R, p],
+                [np.zeros((1, 3)), 1]
+            ])
+            return T
+
+                
+
+        
+        
+        
