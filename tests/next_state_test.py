@@ -35,9 +35,9 @@ robot = youBot()
 config = np.array([chassis_phi,chassis_x,chassis_y,J1,J2,J3,J4,J5,W1,W2,W3,W4,0])
 dt = 0.01
 N = 100
-u_max = 5
+u_max = 12
 
-u = np.array([-10,10,10,-10,1,1,1,1,1])
+u = np.array([10,10,10,10,1,1,1,1,1])
 configs = np.array(config).reshape(1,-1)
 
 for i in range(N):

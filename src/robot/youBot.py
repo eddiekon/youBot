@@ -34,7 +34,7 @@ class youBot:
             [0, 0, 0, 1.0]
         ]) #the end-effector frame {e} relative to the arm base frame {0} When the arm is at its home configuration
 
-        self.u_max = 10 #Maximum speed
+        self.u_max = 15 #Maximum speed
         self.z = 0.0963 #Height of the chassis body frame {b}
         self.dt = 0.01 #Step time (s)
         self.r = 0.0475 #Radius of each wheel (m)
@@ -100,7 +100,6 @@ class youBot:
 
         dwheel = np.array(wheel_speeds*dt)
 
-        #TODO: Obtain new chassis configuration
         wloc = self.wheel_locations
         h = np.empty((len(self.gamma),3))
         beta = np.zeros_like(self.gamma) #Angle of wheel relative to the chassis frame in the x,y plane.
@@ -112,6 +111,8 @@ class youBot:
             h[i,:] = [1/self.r, np.tan(self.gamma[i])/self.r]@betas@wheel #Equation 13.5 from Modern Robotics by Kevin Lynch
 
         Vb = np.linalg.pinv(h)@dwheel #Body twist of chassis [wz,x,y]
+
+        #Vb = self.F @ wheel_speeds
         Vb6 = np.array([0,0,Vb[0],Vb[1],Vb[2],0])
         Tb0b1 = mr.VecTose3(Vb6) #Transformation matrix from old to new configuration for the chassis
 
@@ -122,15 +123,15 @@ class youBot:
             dqb = [0,vbx,vby]
         else:
             dqb = [wbz,
-                   (vbx*np.sin(wbz)+vby*(np.cos(wbz)-1)),
-                   (vby*np.sin(wbz)+vbx*(1-np.cos(wbz)))]
+                   (vbx*np.sin(wbz)+vby*(np.cos(wbz)-1))/wbz,
+                   (vby*np.sin(wbz)+vbx*(1-np.cos(wbz)))/wbz]
 
         phi0 = config[0]
         dq = np.array([[1,0,0],       #Transforming change of position to fixed frame
                        [0,np.cos(phi0),-np.sin(phi0)],
                        [0,np.sin(phi0),np.cos(phi0)]]) @ dqb 
         q0 = config[0:3]
-        q1 = q0 + dq 
+        q1 = q0 + dq
 
         new_config = np.concatenate([q1,next_arm_joint_angles,next_arm_wheel_angles])
 
@@ -198,7 +199,9 @@ class youBot:
             [Rf,pf] = mr.TransToRp(final)            
             travel_distance = np.linalg.norm(pf-pi)
             Rrel = Rf @ Ri.T
-            angle_rotation = (np.trace(Rrel) - 1.0) / 2.0 
+            cos_theta = (np.trace(Rrel) - 1) / 2.0
+            cos_theta = np.clip(cos_theta, -1.0, 1.0)   # Clamp to valid domain
+            angle_rotation = np.arccos(cos_theta)
 
             Tf = round(max(travel_distance/self.v_max,angle_rotation/self.omega_max)/self.dt)*self.dt #Time of segment (s)
             N = Tf * k / self.dt #Number of points 
@@ -240,6 +243,7 @@ class youBot:
         if Tce_standoff is None:
             Tce_standoff = self.Tce_standoff
         self.k = k
+        
         # 1.Move to grasp standoff
         configuration = segment(Tse_initial,Tsc_initial@Tce_standoff,0)
         # 2.Move to grasp
@@ -260,22 +264,65 @@ class youBot:
     def feedback_control(self,X,Xd,Xd1,K,dt):
 
         [Kp,Ki] = K
-        Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Xd) @ X))
+        Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(X) @ Xd))
         self.integral = self.integral + Xerr*dt
         Vdmat = (1/dt)*mr.MatrixLog6(mr.TransInv(Xd)@Xd1)
         Vd = mr.se3ToVec(Vdmat)
-        Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd + Kp@Xerr + Ki@self.integral #PID Controller, end effector twist.
+
+        if self.controller == "P":
+            Ve = Kp@Xerr#P Controller, end effector twist.
+        elif self.controller == "I":
+            Ve = Ki@self.integral #I Controller, end effector twist.
+        elif self.controller == "PI":
+            Ve = Kp@Xerr + Ki@self.integral #PI Controller, end effector twist.
+        elif self.controller == "FF":
+            Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd #Feed-forward Controller, end effector twist.
+        elif self.controller == "FFP":
+            Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd + Kp@Xerr #FFP Controller, end effector twist.
+        elif self.controller == "FFI":
+            Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd + Ki@self.integral #FFI Controller, end effector twist.
+        elif self.controller == "FFPI":
+            Ve = mr.Adjoint(mr.TransInv(X)@Xd)@Vd + Kp@Xerr + Ki@self.integral #FFPI Controller, end effector twist.
         
+
         return Ve
     
-    def simulate_bot(self,trajectory,K,config_initial):
+    def simulate_bot(self,trajectory,K,config_initial,controller="FFPI"):
         
+        def row_to_SE3(row):
+            """
+            Convert a 12-element row [r11, r12, r13, r21, r22, r23, r31, r32, r33, px, py, pz]
+            into a 4x4 homogeneous transformation matrix T_se.
+            """
+            R = np.array([
+                [row[0], row[1], row[2]],
+                [row[3], row[4], row[5]],
+                [row[6], row[7], row[8]]
+            ])
+            p = np.array([[row[9]], [row[10]], [row[11]]])
+            T = np.block([
+                [R, p],
+                [np.zeros((1, 3)), np.array([[1]])]
+            ])
+            return T
+        
+        def test_Joint_Limits(joints):
+            
+            fail = [0,0,0,0,0]
+            for i, joint in enumerate(joints):
+                min_lim, max_lim = self.limit[i]
+                if joint < min_lim or joint > max_lim:
+                    fail[i] = 1
+            
+            return fail
+        
+        self.controller = controller
         k = self.k
         N = len(trajectory)
-        self.integral = 0
+        self.integral = np.zeros(6)
         #Loop through generated trajectory step by step
 
-        config_list = np.array([config_initial]) #List of configurations for results
+        config_list = np.array([config_initial]).reshape(1,-1) #List of configurations for results
         Xerr_list = np.empty((1,6)) #List of errors at every step
         configuration = config_initial
 
@@ -287,9 +334,9 @@ class youBot:
             X = Tsb@self.Tbo@Toe
 
             #Use the controller at this time step for end effector twist needed
-            Xd = self.chassis_to_SE3(trajectory[i,:]) #Reference configuration 
-            Xdnext = self.chassis_to_SE3(trajectory[i+1,:]) #Next reference configuration
-            Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Xd) @ X)) #Error at this step
+            Xd = row_to_SE3(trajectory[i,:]) #Reference configuration 
+            Xdnext = row_to_SE3(trajectory[i+1,:]) #Next reference configuration
+            Xerr = mr.se3ToVec(mr.MatrixLog6(mr.TransInv(X) @ Xd)) #Error at this step
             Ve = self.feedback_control(X,Xd,Xdnext,K,self.dt) #Get end effector twist needed {e}
 
             #Calculate Jacobian
@@ -302,20 +349,29 @@ class youBot:
             ), axis=0)
             Jbase = mr.Adjoint(mr.TransInv(X)@Tsb)@F6 
 
-            np.set_printoptions(precision=3, suppress=True)
             Je = np.hstack((Jbase, Jb))
-
+            
             #Calculate controls required for the twist that is needed
-            controls = np.linalg.pinv(Je,0.01)@Ve
+            controls = np.linalg.pinv(Je)@Ve
 
             #Update configuration
+            new_configuration = self.next_state(configuration[:12],controls,self.dt,self.u_max)
+            new_configuration = np.append(new_configuration,trajectory[i+1,12])
+
+            joints_at_limit = test_Joint_Limits(new_configuration[3:8])
+            for j,joint in enumerate(joints_at_limit):
+                if joint == 1:
+                    Je[:, j+4] = 0
+
+            controls = np.linalg.pinv(Je)@Ve
             configuration = self.next_state(configuration[:12],controls,self.dt,self.u_max)
-            configuration = np.append(configuration,trajectory[i,12])
+            configuration = np.append(configuration,trajectory[i+1,12])
 
             if i%k == 0: #Save Configuration and Xerr for results
                 Xerr_list = np.vstack((Xerr_list,Xerr))
                 config_list = np.vstack((config_list,configuration))
 
+        Xerr_list = np.delete(Xerr_list,0,axis=0)
         return config_list,Xerr_list
     
     def chassis_to_SE3(self,configuration):

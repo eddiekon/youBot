@@ -47,7 +47,7 @@ robot = youBot()
 
 Toe0 = mr.FKinBody(M0e,blist,[0,0,0,0,0])
 Tse_initial = Tsb0@Tbo@Toe0
-trajectory = robot.trajectory_generator(Tse_initial,Tsc_initial,Tsc_final,robot.Tce_grasp,robot.Tce_standoff,1)
+trajectory = robot.trajectory_generator(Tse_initial,Tsc_initial,Tsc_final)
 
 np.savetxt(
     "outputs/trajectory_results.csv",

@@ -41,26 +41,28 @@ X = np.array([
     [ 0.0,    0.0,  0.0,   1.0]
 ])
 
-K = [np.eye((6)),np.zeros((6,6))]
+K = [np.zeros((6,6)),np.zeros((6,6))]
 dt = 0.01
 robot = youBot()
-robot.integral = 0
+robot.integral = np.zeros(6)
 V = robot.feedback_control(X,Xd,Xd_next,K,dt)
 
 print(V)
 
 Jb = mr.JacobianBody(blist,configuration[3:])
- 
+
 F6 = np.concatenate((
     np.zeros((1, 4)),
     np.zeros((1, 4)),
     robot.F,
     np.zeros((1, 4))
 ), axis=0)
+
 Jbase = mr.Adjoint(mr.TransInv(X)@Tsb0)@F6 
 
-np.set_printoptions(precision=3, suppress=True)
+
 Je = np.hstack((Jbase, Jb))
 
 controls = np.linalg.pinv(Je)@V
+np.set_printoptions(precision=3, suppress=True)
 print(controls)

@@ -19,9 +19,17 @@ Tsc_final = np.genfromtxt(file_path, delimiter=",", comments="#",filling_values=
 #----------------------------------------------
 
 config_initial = np.zeros(13)
-K = [np.eye((6)),np.zeros((6,6))]
+config_initial[3] = 0
+config_initial[4] = -0.2
+config_initial[5] = -0.2
+config_initial[6] = -np.pi/2
+config_initial[7] = 0
+K = [np.zeros((6,6)),np.zeros((6,6))]
 
 robot = youBot()
+robot.u_max = 200
+robot.limit = np.array([[-1,1],[-2,-0.05],[-2,-0.05],[-2,-0.05],[-1,1]])
+
 
 Tsb_initial = robot.chassis_to_SE3(config_initial) 
 Toe = mr.FKinBody(robot.M0e,robot.blist,config_initial[3:8])
@@ -29,7 +37,16 @@ Tse_initial = Tsb_initial@robot.Tbo@Toe
 
 ref_traj = robot.trajectory_generator(Tse_initial,Tsc_initial,Tsc_final,k=1)
 
+config_initial[2] = 0
 result,error = robot.simulate_bot(ref_traj,K,config_initial)
+
+np.savetxt(
+    "outputs/simulation_test_reftraj.csv",
+    ref_traj,                   
+    delimiter=",",
+    fmt="%.6f",
+    comments="# "            
+)
 
 np.savetxt(
     "outputs/simulation_test_results.csv",
